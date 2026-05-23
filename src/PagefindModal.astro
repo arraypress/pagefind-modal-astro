@@ -1,0 +1,429 @@
+---
+/**
+ * PagefindModal.astro
+ * -------------------
+ *
+ * Headless replacement for Pagefind's built-in `<pagefind-modal>`
+ * Component UI. Wraps a native `<dialog>` so the browser handles
+ * focus trapping, Esc-to-close, and backdrop hit-testing for free,
+ * then talks to Pagefind via its headless JS API.
+ *
+ * - Lazy-loads `/pagefind/pagefind.js` on first open (or first
+ *   keystroke) — the bundle only exists in production builds, so
+ *   dev mode silently shows the `unavailable` hint instead of
+ *   throwing.
+ * - Trigger via `[data-search-open]` (delegated, so any element
+ *   with that attribute opens the modal — no JS wiring needed in
+ *   your trigger button).
+ * - Keyboard: ⌘K / Ctrl+K toggles. ↑/↓ navigate results. Enter
+ *   opens. Esc closes.
+ * - Focus restoration: the trigger element regains focus on close.
+ * - Results group by URL prefix using configurable `sections`.
+ * - Re-binds cleanly on Astro view transitions via a dataset marker.
+ *
+ * ## Pagefind meta you can render
+ *
+ * The modal reads these `meta` keys per result (set them on your
+ * pages via `data-pagefind-meta="key:value"`):
+ *
+ *   - `title`     headline
+ *   - `image`     thumbnail
+ *   - `category`  chip above the title
+ *   - `price`     chip above the title (e.g. `'£49'`)
+ *   - `artist`    "by …" subline
+ *   - `summary`   plain-text excerpt (preferred over Pagefind's auto)
+ *
+ * Anything not set is silently omitted.
+ *
+ * @example
+ *   ---
+ *   import { PagefindModal } from '@arraypress/pagefind-modal-astro';
+ *   ---
+ *   <PagefindModal />
+ *
+ *   <button data-search-open>Search</button>
+ */
+
+import { DEFAULT_SECTIONS, DEFAULT_STRINGS } from './types';
+import type { PagefindModalProps } from './types';
+
+const {
+	id = 'pf-search-modal',
+	pagefindPath = '/pagefind/pagefind.js',
+	sections = DEFAULT_SECTIONS,
+	strings: stringsProp,
+	maxResults = 12,
+	excerptLength = 25,
+	debounceMs = 120,
+	class: className,
+} = Astro.props as PagefindModalProps;
+
+const strings = { ...DEFAULT_STRINGS, ...(stringsProp ?? {}) };
+---
+
+<dialog id={id} class:list={['pf-modal', className]} aria-label={strings.ariaLabel}>
+	<div class="pf-modal__panel" role="document">
+		<header class="pf-modal__head">
+			<svg class="pf-modal__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+				<circle cx="11" cy="11" r="8"/>
+				<line x1="21" y1="21" x2="16.65" y2="16.65"/>
+			</svg>
+			<input
+				class="pf-modal__input"
+				type="search"
+				autocomplete="off"
+				autocorrect="off"
+				autocapitalize="off"
+				spellcheck="false"
+				placeholder={strings.placeholder}
+				aria-label={strings.ariaLabel}
+				aria-controls={`${id}-results`}
+				aria-autocomplete="list"
+				data-pf-input
+			/>
+			<kbd class="pf-modal__kbd" aria-hidden="true">Esc</kbd>
+			<button type="button" class="pf-modal__close" data-search-close aria-label={strings.closeLabel}>
+				<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+					<path d="M18 6 6 18M6 6l12 12"/>
+				</svg>
+			</button>
+		</header>
+
+		<div id={`${id}-results`} class="pf-modal__results" role="listbox" aria-live="polite" data-pf-results>
+			<p class="pf-modal__hint" data-state="idle">{strings.idleHint}</p>
+		</div>
+
+		<footer class="pf-modal__foot" aria-hidden="true">
+			<span><kbd>↑</kbd><kbd>↓</kbd> {strings.navHint}</span>
+			<span><kbd>↵</kbd> {strings.openHint}</span>
+			<span><kbd>Esc</kbd> {strings.closeHint}</span>
+		</footer>
+	</div>
+</dialog>
+
+<script
+	is:inline
+	data-astro-rerun
+	define:vars={{
+		PF_ID: id,
+		PF_PATH: pagefindPath,
+		PF_SECTIONS: sections,
+		PF_STRINGS: strings,
+		PF_MAX_RESULTS: maxResults,
+		PF_EXCERPT_LENGTH: excerptLength,
+		PF_DEBOUNCE_MS: debounceMs,
+	}}
+>
+	(function () {
+		var dialog = document.getElementById(PF_ID);
+		if (!dialog || dialog.dataset.pfInit === '1') return;
+		dialog.dataset.pfInit = '1';
+
+		var input = dialog.querySelector('[data-pf-input]');
+		var out   = dialog.querySelector('[data-pf-results]');
+		if (!input || !out) return;
+
+		var pagefindPromise = null;
+		function loadPagefind() {
+			if (pagefindPromise) return pagefindPromise;
+			pagefindPromise = import(/* @vite-ignore */ PF_PATH)
+				.then(async function (mod) {
+					if (mod.options) await mod.options({ excerptLength: PF_EXCERPT_LENGTH });
+					if (mod.init)    await mod.init();
+					return mod;
+				})
+				.catch(function (err) {
+					pagefindPromise = null;
+					throw err;
+				});
+			return pagefindPromise;
+		}
+
+		function sectionForUrl(url) {
+			try {
+				var path = new URL(url, window.location.origin).pathname;
+				for (var i = 0; i < PF_SECTIONS.length; i++) {
+					var s = PF_SECTIONS[i];
+					if (!s.prefix || path.startsWith(s.prefix)) {
+						return { key: s.key, label: s.label, order: s.order };
+					}
+				}
+			} catch (_) {}
+			var fallback = PF_SECTIONS[PF_SECTIONS.length - 1] || { key: 'pages', label: 'Pages', order: 9 };
+			return { key: fallback.key, label: fallback.label, order: fallback.order };
+		}
+
+		function escapeHtml(s) {
+			return String(s == null ? '' : s)
+				.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+				.replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+		}
+		function safeExcerpt(raw) {
+			if (!raw) return '';
+			var parts = String(raw).split(/(<mark>.*?<\/mark>)/g);
+			return parts.map(function (p) {
+				return p.startsWith('<mark>') && p.endsWith('</mark>')
+					? '<mark>' + escapeHtml(p.slice(6, -7)) + '</mark>'
+					: escapeHtml(p);
+			}).join('');
+		}
+
+		var selectedIndex = -1;
+		var resultLinks = [];
+		var queryToken = 0;
+		var debounceId = 0;
+		var lastFocused = null;
+
+		function setHint(text, state) {
+			out.innerHTML = '<p class="pf-modal__hint" data-state="' + (state || 'idle') + '">' +
+				escapeHtml(text) + '</p>';
+			resultLinks = [];
+			selectedIndex = -1;
+		}
+
+		function updateSelection() {
+			resultLinks.forEach(function (a, i) {
+				var sel = i === selectedIndex;
+				a.setAttribute('aria-selected', sel ? 'true' : 'false');
+				if (sel) a.scrollIntoView({ block: 'nearest' });
+			});
+		}
+
+		function renderResults(groups) {
+			var sorted = Object.values(groups).sort(function (a, b) { return a.order - b.order; });
+			if (sorted.length === 0) { setHint(PF_STRINGS.noResults, 'empty'); return; }
+
+			var frag = document.createDocumentFragment();
+			resultLinks = [];
+			for (var g = 0; g < sorted.length; g++) {
+				var group = sorted[g];
+				if (!group.items.length) continue;
+
+				var section = document.createElement('section');
+				section.className = 'pf-group';
+				section.setAttribute('data-group', group.key);
+
+				var heading = document.createElement('h3');
+				heading.className = 'pf-group__heading';
+				heading.textContent = group.label;
+				section.appendChild(heading);
+
+				for (var i = 0; i < group.items.length; i++) {
+					var item = group.items[i];
+					var d = item.data || {};
+					var meta = d.meta || {};
+					var title = meta.title || d.url || 'Untitled';
+					var url = d.url || item.url;
+					var excerpt = d.excerpt;
+					var image = meta.image;
+
+					var a = document.createElement('a');
+					a.className = 'pf-result';
+					a.href = url;
+					a.setAttribute('role', 'option');
+
+					if (image) {
+						var img = document.createElement('img');
+						img.className = 'pf-result__thumb';
+						img.src = image;
+						img.alt = '';
+						img.loading = 'lazy';
+						img.decoding = 'async';
+						a.appendChild(img);
+					} else {
+						var ph = document.createElement('span');
+						ph.className = 'pf-result__thumb pf-result__thumb--placeholder';
+						ph.setAttribute('aria-hidden', 'true');
+						ph.textContent = (title || '?').slice(0, 1).toUpperCase();
+						a.appendChild(ph);
+					}
+
+					var body = document.createElement('div');
+					body.className = 'pf-result__body';
+
+					var category = meta.category;
+					var price = meta.price;
+					var artist = meta.artist;
+					if (category || price) {
+						var metaRow = document.createElement('div');
+						metaRow.className = 'pf-result__meta';
+						if (category) {
+							var chip = document.createElement('span');
+							chip.className = 'pf-result__chip pf-result__chip--category';
+							chip.textContent = category;
+							metaRow.appendChild(chip);
+						}
+						if (price) {
+							var priceEl = document.createElement('span');
+							priceEl.className = 'pf-result__price';
+							priceEl.textContent = price;
+							metaRow.appendChild(priceEl);
+						}
+						body.appendChild(metaRow);
+					}
+
+					var titleEl = document.createElement('span');
+					titleEl.className = 'pf-result__title';
+					titleEl.textContent = title;
+					body.appendChild(titleEl);
+
+					if (artist) {
+						var artistEl = document.createElement('span');
+						artistEl.className = 'pf-result__artist';
+						artistEl.textContent = 'by ' + artist;
+						body.appendChild(artistEl);
+					}
+
+					var description = meta.summary || excerpt;
+					if (description) {
+						var exEl = document.createElement('span');
+						exEl.className = 'pf-result__excerpt';
+						if (meta.summary) exEl.textContent = description;
+						else              exEl.innerHTML  = safeExcerpt(description);
+						body.appendChild(exEl);
+					}
+
+					var urlEl = document.createElement('span');
+					urlEl.className = 'pf-result__url';
+					urlEl.textContent = url;
+					body.appendChild(urlEl);
+
+					a.appendChild(body);
+
+					(function (link) {
+						link.addEventListener('mouseenter', function () {
+							selectedIndex = resultLinks.indexOf(link);
+							updateSelection();
+						});
+						link.addEventListener('click', function () { closeModal(); });
+					})(a);
+
+					section.appendChild(a);
+					resultLinks.push(a);
+				}
+				frag.appendChild(section);
+			}
+
+			out.innerHTML = '';
+			out.appendChild(frag);
+			selectedIndex = resultLinks.length ? 0 : -1;
+			updateSelection();
+		}
+
+		async function runQuery(q) {
+			var token = ++queryToken;
+			if (!q || q.trim().length === 0) { setHint(PF_STRINGS.idleHint, 'idle'); return; }
+
+			var pagefind;
+			try { pagefind = await loadPagefind(); }
+			catch (_) {
+				if (token !== queryToken) return;
+				setHint(PF_STRINGS.unavailable, 'unavailable');
+				return;
+			}
+			if (token !== queryToken) return;
+
+			setHint(PF_STRINGS.loadingHint, 'loading');
+
+			var res;
+			try { res = await pagefind.search(q); }
+			catch (_) {
+				if (token !== queryToken) return;
+				setHint(PF_STRINGS.error, 'error');
+				return;
+			}
+			if (token !== queryToken) return;
+			if (!res || !res.results || res.results.length === 0) {
+				setHint(PF_STRINGS.noResults, 'empty');
+				return;
+			}
+
+			var limited = res.results.slice(0, PF_MAX_RESULTS);
+			var hydrated = await Promise.all(limited.map(async function (r) {
+				try {
+					var data = await r.data();
+					return { url: r.url || data.url, data: data };
+				} catch (_) { return null; }
+			}));
+			if (token !== queryToken) return;
+
+			var groups = {};
+			for (var i = 0; i < hydrated.length; i++) {
+				var h = hydrated[i];
+				if (!h) continue;
+				var url = (h.data && h.data.url) || h.url || '';
+				var sec = sectionForUrl(url);
+				if (!groups[sec.key]) groups[sec.key] = { key: sec.key, label: sec.label, order: sec.order, items: [] };
+				groups[sec.key].items.push(h);
+			}
+			renderResults(groups);
+		}
+
+		function onInput() {
+			var q = input.value;
+			clearTimeout(debounceId);
+			debounceId = window.setTimeout(function () { runQuery(q); }, PF_DEBOUNCE_MS);
+		}
+
+		function openModal() {
+			if (dialog.open) return;
+			lastFocused = document.activeElement;
+			if (typeof dialog.showModal === 'function') dialog.showModal();
+			else dialog.setAttribute('open', '');
+			document.body.classList.add('pf-search-open');
+			loadPagefind().catch(function () {});
+			requestAnimationFrame(function () { input.focus(); input.select(); });
+		}
+
+		function closeModal() {
+			if (!dialog.open) return;
+			if (typeof dialog.close === 'function') dialog.close();
+			else dialog.removeAttribute('open');
+			document.body.classList.remove('pf-search-open');
+			if (lastFocused && typeof lastFocused.focus === 'function') {
+				var target = lastFocused;
+				lastFocused = null;
+				requestAnimationFrame(function () { target.focus(); });
+			}
+		}
+
+		document.addEventListener('click', function (e) {
+			var t = e.target;
+			if (!t || !t.closest) return;
+			if (t.closest('[data-search-open]')) { e.preventDefault(); openModal(); return; }
+			if (t.closest('[data-search-close]')) { e.preventDefault(); closeModal(); return; }
+		});
+
+		document.addEventListener('keydown', function (e) {
+			if ((e.metaKey || e.ctrlKey) && (e.key === 'k' || e.key === 'K')) {
+				e.preventDefault();
+				if (dialog.open) closeModal(); else openModal();
+			}
+		});
+
+		dialog.addEventListener('click', function (e) { if (e.target === dialog) closeModal(); });
+		dialog.addEventListener('cancel', function () { document.body.classList.remove('pf-search-open'); });
+		dialog.addEventListener('close',  function () { document.body.classList.remove('pf-search-open'); });
+
+		input.addEventListener('keydown', function (e) {
+			if (e.key === 'ArrowDown') {
+				if (!resultLinks.length) return;
+				e.preventDefault();
+				selectedIndex = (selectedIndex + 1) % resultLinks.length;
+				updateSelection();
+			} else if (e.key === 'ArrowUp') {
+				if (!resultLinks.length) return;
+				e.preventDefault();
+				selectedIndex = (selectedIndex - 1 + resultLinks.length) % resultLinks.length;
+				updateSelection();
+			} else if (e.key === 'Enter') {
+				if (selectedIndex >= 0 && resultLinks[selectedIndex]) {
+					e.preventDefault();
+					var href = resultLinks[selectedIndex].getAttribute('href');
+					if (href) { closeModal(); window.location.href = href; }
+				}
+			}
+		});
+		input.addEventListener('input', onInput);
+	})();
+</script>
